@@ -1,12 +1,15 @@
 package com.lbs.mycamera2basic
 
+import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Matrix
 import android.graphics.Point
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
+import android.hardware.camera2.*
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
 import android.os.Bundle
@@ -16,21 +19,32 @@ import android.view.View
 import android.view.ViewGroup
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import android.util.Size
+import android.view.Surface
 import android.view.TextureView
 import android.view.TextureView.SurfaceTextureListener
 import android.view.WindowInsets
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.util.Collections
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 class Camera2BasicFragment : Fragment() {
 
     private var mBackgroundThread:HandlerThread? = null
     private var mBackgroundHandler:Handler? = null
-    private var mTextureView:TextureView? = null
+    private var mTextureView:AutoFitTextureView? = null
     private var mImageReader:ImageReader ? = null
     private var mCameraId:String ? = null
     private var mCameraDevice:CameraDevice? = null
     private var mPreviewSize:Size? = null
+    private var mPreViewRequestBuilder:CaptureRequest.Builder?=null
+    private var mPreViewRequest:CaptureRequest?=null
+    private var mCaptureSession:CameraCaptureSession?=null
+    private val mCameraOpenCloseLock = Semaphore(1)
+
     private val mSurfaceTextureListener = object:SurfaceTextureListener{
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
             openCamera(width, height)
@@ -45,22 +59,78 @@ class Camera2BasicFragment : Fragment() {
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
 
     }
+
     private val mCameraDeviceStateCallback = object:CameraDevice.StateCallback(){
         override fun onOpened(camera: CameraDevice) {
+            mCameraOpenCloseLock.release()
             mCameraDevice = camera
             createCameraPreViewSession()
         }
 
         override fun onDisconnected(camera: CameraDevice) {
-
+            mCameraOpenCloseLock.release()
+            mCameraDevice?.close()
+            mCameraDevice = null
         }
 
-        override fun onError(camera: CameraDevice, error: Int) {}
+        override fun onError(camera: CameraDevice, error: Int) {
+            mCameraOpenCloseLock.release()
+            mCameraDevice?.close()
+            mCameraDevice = null
+            activity?.finish()
+        }
 
     }
 
-    private fun createCameraPreViewSession() {
+    // LBSTags5：还没拍照，先不写
+    private val mCaptureCallback = object:CameraCaptureSession.CaptureCallback(){
+        override fun onCaptureProgressed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            partialResult: CaptureResult
+        ) {
+            super.onCaptureProgressed(session, request, partialResult)
+        }
 
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            super.onCaptureCompleted(session, request, result)
+        }
+    }
+
+    private fun createCameraPreViewSession() {
+        val texture = mTextureView!!.surfaceTexture
+        texture!!.setDefaultBufferSize(mPreviewSize!!.width,mPreviewSize!!.height)
+        val surface = Surface(texture)
+        mPreViewRequestBuilder = mCameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(surface)
+        }
+        val sessionConfiguration = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
+            Collections.singletonList(OutputConfiguration(surface)),
+            requireActivity().mainExecutor,
+            object:CameraCaptureSession.StateCallback(){
+            override fun onConfigured(session: CameraCaptureSession) {
+                mCaptureSession=session
+                try {
+                    mPreViewRequestBuilder!!.set(CaptureRequest.CONTROL_AE_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    //LBSTag4 闪光灯先阉割了
+                    mPreViewRequest=mPreViewRequestBuilder!!.build()
+                    mCaptureSession!!.setRepeatingRequest(mPreViewRequest!!,mCaptureCallback,mBackgroundHandler)
+                }catch (e:Exception){
+                    e.printStackTrace()
+                }
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+
+            }
+
+        })
+        mCameraDevice!!.createCaptureSession(sessionConfiguration)
     }
 
 
@@ -92,7 +162,6 @@ class Camera2BasicFragment : Fragment() {
     }
 
     override fun onPause() {
-
         stopBackgroundThread()
         super.onPause()
     }
@@ -115,15 +184,20 @@ class Camera2BasicFragment : Fragment() {
         }
     }
 
+    /**
+     * @param width The width of current SurfaceTexture
+     * @param height The height of current SurfaceTexture
+     */
     private fun openCamera(width:Int, height:Int) {
         requestCameraPermission()
         setupCameraOutputs(width, height)
+        configureTransform(width,height)
         openCameraById()
     }
 
     private fun requestCameraPermission(){
         // 发现没有权限
-        if(ContextCompat.checkSelfPermission(requireActivity(), android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_DENIED){
+        if(ContextCompat.checkSelfPermission(requireActivity(), android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED){
             requestPermissions(arrayOf(android.Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION)
         }
     }
@@ -166,12 +240,19 @@ class Camera2BasicFragment : Fragment() {
                 val bounds = metrics.bounds
                 val displaySize = Size(bounds.width()-insetsWidth, bounds.height()-insetsHeight)
 
-                val rotatedPreviewWidth = width
-                val rotatedPreviewHeight = height
-                val maxPreviewWidth = displaySize.width
-                val maxPreviewHeight = displaySize.height
+                val maxPreviewWidth = displaySize.width.coerceAtMost(MAX_DISPLAY_WIDTH)
+                val maxPreviewHeight = displaySize.height.coerceAtMost(MAX_DISPLAY_HEIGHT)
 
-                mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture),rotatedPreviewWidth, rotatedPreviewHeight, )
+                // 这里选择符合3：4的最适合的Size
+                val size = Size(3, 4)
+                mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture::class.java),width, height, maxPreviewWidth, maxPreviewHeight, size);
+                mTextureView!!.setRatio(size.width, size.height)
+
+                // LBSTags2：闪光灯判断
+                // val available = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+
+                mCameraId = cameraId
+                return
             }
         }catch (e:Exception){
             e.printStackTrace()
@@ -179,20 +260,98 @@ class Camera2BasicFragment : Fragment() {
     }
 
     private fun openCameraById() {
-
+        val manager = requireActivity().getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            if(!mCameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)){
+                throw java.lang.RuntimeException("Time out waiting to lock camera opening.")
+            }
+            if (ActivityCompat.checkSelfPermission(
+                    requireActivity(),
+                    Manifest.permission.CAMERA
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                // 不给权限？粗暴关闭
+                return
+            }
+            mCameraId?.let {
+                manager.openCamera(it, mCameraDeviceStateCallback, mBackgroundHandler)
+            };
+        }catch (e:Exception){
+            e.printStackTrace()
+        }
     }
 
+    /** 除了choices外，所有的widths和heights都是相对于display而言
+     * @return the optimal size of display
+     */
     private fun chooseOptimalSize(choices:Array<Size>, textureViewWidth:Int, textureViewHeight:Int,
                                   maxWidth:Int, maxHeight:Int, aspectRatio:Size):Size{
+        if(choices.isEmpty())
+            throw IllegalArgumentException("choices is empty, which means there are not suitable format for your class")
 
+        val bigEnoughList = ArrayList<Size>()
+        val notBigEnoughList = ArrayList<Size>()
+
+        for(choice in choices){
+            if(choice.width<=maxHeight && choice.height<=maxWidth
+                && choice.width*aspectRatio.width==choice.height*aspectRatio.height){
+                if(choice.width>=textureViewHeight && choice.height>=textureViewWidth){
+                    bigEnoughList.add(choice)
+                }else{
+                    notBigEnoughList.add(choice)
+                }
+            }
+        }
+        var reverseRes:Size? = null
+        if (bigEnoughList.isNotEmpty()){
+            reverseRes = Collections.min(bigEnoughList,CompareSizesByArea());
+        }else if(notBigEnoughList.isNotEmpty()){
+            reverseRes = Collections.max(notBigEnoughList, CompareSizesByArea());
+        }else{
+            Log.d(TAGS, "could not find a Size suitable for your aspectRatio")
+            reverseRes = choices[0];
+        }
+        return Size(reverseRes!!.height, reverseRes!!.width)
     }
 
-    // 暂放
     private fun configureTransform(width: Int, height: Int) {
+        /*notNull(activity, mTextureView, mPreviewSize){
+            // 屏幕自然方向
+            val rotation = activity?.display?.rotation?:Surface.ROTATION_0
+            val matrix = Matrix();
+            val viewRect = RectF(0F, 0F, width.toFloat(), height.toFloat())
+            val bufferRect = RectF(0F, 0F, mPreviewSize!!.height.toFloat(), mPreviewSize!!.width.toFloat())
+            val centerX = viewRect.centerX()
+            val centerY = viewRect.centerY()
+            // LBSTag3 这部分，感觉没必要啊，相机不转啊，先放放
+            when(rotation){
+                Surface.ROTATION_90, Surface.ROTATION_270 -> {
+
+                }
+            }
+            mTextureView?.setTransform(matrix)
+        }*/
+
+        val rotation = requireActivity().display!!.rotation
 
     }
+
+    inline fun <T> notNull(vararg args:Any?, block:()->T)=
+        when (args.filterNotNull().size) {
+            args.size -> block()
+            else -> null
+        }
 
     companion object{
         const val REQUEST_CAMERA_PERMISSION = 1
+        const val MAX_DISPLAY_WIDTH = 1080
+        const val MAX_DISPLAY_HEIGHT = 1920
+        const val TAGS = "LBSTags"
+    }
+
+    class CompareSizesByArea:Comparator<Size>{
+        override fun compare(o1: Size, o2: Size): Int {
+            return o1.height*o1.width -o2.height*o2.width
+        }
     }
 }

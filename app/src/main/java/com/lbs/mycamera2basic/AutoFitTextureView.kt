@@ -4,13 +4,16 @@ import android.content.Context
 import android.util.AttributeSet
 import android.view.TextureView
 
-class AutoFitTextureView(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0) :
+class AutoFitTextureView(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int) :
     TextureView(context, attrs, defStyleAttr) {
+
+    constructor(context: Context) : this(context, null, 0)
+    constructor(context: Context, attrs: AttributeSet?=null):this(context,attrs,0)
 
     private var mRatioWidth = 0
     private var mRatioHeight = 0
 
-    fun setRatio(width:Int, height:Int){
+    public fun setRatio(width:Int, height:Int){
         if(width<0||height<0){
             throw java.lang.IllegalArgumentException("Size cannot be negative")
         }
