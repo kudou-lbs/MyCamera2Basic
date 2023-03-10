@@ -3,14 +3,11 @@ package com.lbs.mycamera2basic
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Matrix
-import android.graphics.Point
-import android.graphics.RectF
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
-import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
 import android.os.Bundle
 import androidx.fragment.app.Fragment
@@ -22,16 +19,16 @@ import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import android.view.Surface
-import android.view.TextureView
 import android.view.TextureView.SurfaceTextureListener
 import android.view.WindowInsets
+import android.widget.Switch
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.Collections
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
-class Camera2BasicFragment : Fragment() {
+class Camera2BasicFragment : Fragment(), View.OnClickListener {
 
     private var mBackgroundThread:HandlerThread? = null
     private var mBackgroundHandler:Handler? = null
@@ -44,6 +41,8 @@ class Camera2BasicFragment : Fragment() {
     private var mPreViewRequest:CaptureRequest?=null
     private var mCaptureSession:CameraCaptureSession?=null
     private val mCameraOpenCloseLock = Semaphore(1)
+    // 当前状态，用于追踪拍照进度（3A等），默认处于预览状态，这个状态下mCaptureCallback并不会执行什么额外行为
+    private var mState = STATE_PREVIEW
 
     private val mSurfaceTextureListener = object:SurfaceTextureListener{
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -84,12 +83,40 @@ class Camera2BasicFragment : Fragment() {
 
     // LBSTags5：还没拍照，先不写
     private val mCaptureCallback = object:CameraCaptureSession.CaptureCallback(){
+
+        fun process(result:CaptureResult){
+            when(mState){
+                STATE_PREVIEW -> {}
+                STATE_WAITING_LOCK ->{
+                    val afState = result.get(CaptureResult.CONTROL_AF_STATE);
+                    // 对焦结束或相机不支持自带对焦
+                    when(afState){
+                        null ->  captureStillPicture()
+                        CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED,
+                        CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ->{
+                            val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                            when(aeState){
+                                null -> {
+                                    mState = STATE_PICTURE_TAKEN
+                                    captureStillPicture()
+                                }
+                                else -> {
+                                    runPrecaptureSequence()
+                                }
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+
         override fun onCaptureProgressed(
             session: CameraCaptureSession,
             request: CaptureRequest,
             partialResult: CaptureResult
         ) {
-            super.onCaptureProgressed(session, request, partialResult)
+            process(partialResult)
         }
 
         override fun onCaptureCompleted(
@@ -97,8 +124,16 @@ class Camera2BasicFragment : Fragment() {
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
-            super.onCaptureCompleted(session, request, result)
+            process(result)
         }
+    }
+
+    private fun runPrecaptureSequence() {
+        TODO("Not yet implemented")
+    }
+
+    private fun captureStillPicture() {
+        TODO("Not yet implemented")
     }
 
     private fun createCameraPreViewSession() {
@@ -108,14 +143,16 @@ class Camera2BasicFragment : Fragment() {
         mPreViewRequestBuilder = mCameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(surface)
         }
+        // 会话配置。
         val sessionConfiguration = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
-            Collections.singletonList(OutputConfiguration(surface)),
+            listOfNotNull(OutputConfiguration(surface), OutputConfiguration(mImageReader!!.surface)),
             requireActivity().mainExecutor,
             object:CameraCaptureSession.StateCallback(){
             override fun onConfigured(session: CameraCaptureSession) {
                 mCaptureSession=session
                 try {
-                    mPreViewRequestBuilder!!.set(CaptureRequest.CONTROL_AE_MODE,
+                    // 自动对焦
+                    mPreViewRequestBuilder!!.set(CaptureRequest.CONTROL_AF_MODE,
                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     //LBSTag4 闪光灯先阉割了
                     mPreViewRequest=mPreViewRequestBuilder!!.build()
@@ -150,6 +187,7 @@ class Camera2BasicFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        view.findViewById<View>(R.id.take_photo).setOnClickListener(this)
         mTextureView = view.findViewById(R.id.texture)
     }
 
@@ -162,8 +200,25 @@ class Camera2BasicFragment : Fragment() {
     }
 
     override fun onPause() {
+        closeCaMera()
         stopBackgroundThread()
         super.onPause()
+    }
+
+    private fun closeCaMera() {
+        try {
+            mCameraOpenCloseLock.acquire()
+            mCaptureSession?.close()
+            mCaptureSession=null
+            mCameraDevice?.close()
+            mCameraDevice=null
+            mImageReader?.close()
+            mImageReader=null
+        }catch (e:InterruptedException){
+            throw java.lang.RuntimeException("Interrupted while trying to lock camera closing", e)
+        }finally {
+            mCameraOpenCloseLock.release()
+        }
     }
 
     private fun startBackgroundThread() {
@@ -190,7 +245,7 @@ class Camera2BasicFragment : Fragment() {
      */
     private fun openCamera(width:Int, height:Int) {
         requestCameraPermission()
-        setupCameraOutputs(width, height)
+        setUpCameraOutputs(width, height)
         configureTransform(width,height)
         openCameraById()
     }
@@ -218,7 +273,7 @@ class Camera2BasicFragment : Fragment() {
     }
 
     // 选择摄像头并设置
-    private fun setupCameraOutputs(width: Int, height: Int) {
+    private fun setUpCameraOutputs(width: Int, height: Int) {
         val manager:CameraManager= requireActivity().getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
             for(cameraId in manager.cameraIdList){
@@ -232,6 +287,7 @@ class Camera2BasicFragment : Fragment() {
                     ?: continue
 
                 // 目前只适配手机且只有一个方向！！！
+                // LBSTags：这部分还不太明白，只知道是要获取屏幕尺寸
                 val metrics = requireActivity().windowManager.currentWindowMetrics
                 val insets= metrics.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars()
                         or WindowInsets.Type.displayCutout())
@@ -243,9 +299,14 @@ class Camera2BasicFragment : Fragment() {
                 val maxPreviewWidth = displaySize.width.coerceAtMost(MAX_DISPLAY_WIDTH)
                 val maxPreviewHeight = displaySize.height.coerceAtMost(MAX_DISPLAY_HEIGHT)
 
+                var mImageReaderSize:Size?=null
                 // 这里选择符合3：4的最适合的Size
                 val size = Size(3, 4)
-                mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture::class.java),width, height, maxPreviewWidth, maxPreviewHeight, size);
+                val sizesOfImageReaderAndDisplay= chooseOptimalSize(map.getOutputSizes(SurfaceTexture::class.java),width, height, maxPreviewWidth, maxPreviewHeight, size);
+                mImageReaderSize = sizesOfImageReaderAndDisplay.first
+                mImageReader = ImageReader.newInstance(mImageReaderSize.width, mImageReaderSize.height,
+                    ImageFormat.JPEG, 2)
+                mPreviewSize = sizesOfImageReaderAndDisplay.second
                 mTextureView!!.setRatio(size.width, size.height)
 
                 // LBSTags2：闪光灯判断
@@ -282,10 +343,11 @@ class Camera2BasicFragment : Fragment() {
     }
 
     /** 除了choices外，所有的widths和heights都是相对于display而言
-     * @return the optimal size of display
+     * @return size1 is the largest size among the options that meet the requirements (for ImageReader)
+     * @return size2 is the most suitable size for display
      */
     private fun chooseOptimalSize(choices:Array<Size>, textureViewWidth:Int, textureViewHeight:Int,
-                                  maxWidth:Int, maxHeight:Int, aspectRatio:Size):Size{
+                                  maxWidth:Int, maxHeight:Int, aspectRatio:Size):Pair<Size, Size>{
         if(choices.isEmpty())
             throw IllegalArgumentException("choices is empty, which means there are not suitable format for your class")
 
@@ -302,38 +364,45 @@ class Camera2BasicFragment : Fragment() {
                 }
             }
         }
-        var reverseRes:Size? = null
+
+        var reverseRes1:Size? = null
+        var reverseRes2:Size? = null
         if (bigEnoughList.isNotEmpty()){
-            reverseRes = Collections.min(bigEnoughList,CompareSizesByArea());
+            reverseRes1 = Collections.max(bigEnoughList,CompareSizesByArea());
+            reverseRes2 = Collections.min(bigEnoughList,CompareSizesByArea());
         }else if(notBigEnoughList.isNotEmpty()){
-            reverseRes = Collections.max(notBigEnoughList, CompareSizesByArea());
+            reverseRes1 = Collections.max(notBigEnoughList, CompareSizesByArea());
+            reverseRes2 = reverseRes1
         }else{
             Log.d(TAGS, "could not find a Size suitable for your aspectRatio")
-            reverseRes = choices[0];
+            reverseRes1 = choices[0];
+            reverseRes2 = reverseRes1
         }
-        return Size(reverseRes!!.height, reverseRes!!.width)
+        return Pair(Size(reverseRes1!!.height, reverseRes1!!.width),Size(reverseRes2!!.height, reverseRes2!!.width))
     }
 
+    /**
+     * empty function: It is used to adapt to different screen sizes and orientations,
+     *          but currently only the vertical screen of mobile phones is studied,
+     *          and no conversion is required, so it is empty
+     */
     private fun configureTransform(width: Int, height: Int) {
-        /*notNull(activity, mTextureView, mPreviewSize){
-            // 屏幕自然方向
-            val rotation = activity?.display?.rotation?:Surface.ROTATION_0
-            val matrix = Matrix();
-            val viewRect = RectF(0F, 0F, width.toFloat(), height.toFloat())
-            val bufferRect = RectF(0F, 0F, mPreviewSize!!.height.toFloat(), mPreviewSize!!.width.toFloat())
-            val centerX = viewRect.centerX()
-            val centerY = viewRect.centerY()
-            // LBSTag3 这部分，感觉没必要啊，相机不转啊，先放放
-            when(rotation){
-                Surface.ROTATION_90, Surface.ROTATION_270 -> {
 
-                }
-            }
-            mTextureView?.setTransform(matrix)
-        }*/
+    }
 
-        val rotation = requireActivity().display!!.rotation
-
+    private fun takePhoto() {
+        try {
+            // 设置自动对焦，此处的builder是复用预览的，部分属性保留，包括为预览模式，target为texture
+            // 此处将CONTROL_AF_TRIGGER设置为触发自动对焦（之前为）
+            mPreViewRequestBuilder!!.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                CaptureRequest.CONTROL_AF_TRIGGER_START)
+            // 等待对焦
+            mState = STATE_WAITING_LOCK
+            mCaptureSession!!.capture(mPreViewRequestBuilder!!.build(), mCaptureCallback,
+                mBackgroundHandler)
+        }catch (e:Exception){
+            e.printStackTrace()
+        }
     }
 
     inline fun <T> notNull(vararg args:Any?, block:()->T)=
@@ -342,16 +411,33 @@ class Camera2BasicFragment : Fragment() {
             else -> null
         }
 
+    class CompareSizesByArea:Comparator<Size>{
+        override fun compare(o1: Size, o2: Size): Int {
+            return o1.height*o1.width -o2.height*o2.width
+        }
+    }
+
+    override fun onClick(v: View?) {
+        v?.apply {
+            when(id){
+                R.id.take_photo -> {
+                    takePhoto();
+                }
+            }
+        }
+    }
+
     companion object{
         const val REQUEST_CAMERA_PERMISSION = 1
         const val MAX_DISPLAY_WIDTH = 1080
         const val MAX_DISPLAY_HEIGHT = 1920
         const val TAGS = "LBSTags"
-    }
 
-    class CompareSizesByArea:Comparator<Size>{
-        override fun compare(o1: Size, o2: Size): Int {
-            return o1.height*o1.width -o2.height*o2.width
-        }
+        const val STATE_PREVIEW = 0
+        const val STATE_WAITING_LOCK = 1
+        const val STATE_WAITING_PRECAPTURE = 2
+        const val STATE_WAITING_NON_PRECAPTURE = 3
+        const val STATE_PICTURE_TAKEN = 4
+
     }
 }
